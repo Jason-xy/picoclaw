@@ -43,6 +43,23 @@ func (m *mockChannel) EditMessage(ctx context.Context, chatID, messageID, conten
 	return nil
 }
 
+type mockStreamer struct{}
+
+func (m *mockStreamer) Update(ctx context.Context, accumulated string) error { return nil }
+func (m *mockStreamer) Finalize(ctx context.Context, finalContent string) (bool, error) {
+	return true, nil
+}
+func (m *mockStreamer) Cancel(ctx context.Context) error { return nil }
+
+type mockStreamingChannel struct {
+	*mockChannel
+	streamer Streamer
+}
+
+func (m *mockStreamingChannel) BeginStream(ctx context.Context, chatID string) (Streamer, error) {
+	return m.streamer, nil
+}
+
 // newTestManager creates a minimal Manager suitable for unit tests.
 func newTestManager() *Manager {
 	return &Manager{
@@ -72,6 +89,24 @@ func TestSendWithRetry_Success(t *testing.T) {
 
 	if callCount != 1 {
 		t.Fatalf("expected 1 Send call, got %d", callCount)
+	}
+}
+
+func TestGetStreamer_ReturnsStreamingSurface(t *testing.T) {
+	m := newTestManager()
+	streamer := &mockStreamer{}
+	ch := &mockStreamingChannel{
+		mockChannel: &mockChannel{sendFn: func(_ context.Context, _ bus.OutboundMessage) error { return nil }},
+		streamer:    streamer,
+	}
+	m.RegisterChannel("stream", ch)
+
+	got, ok := m.GetStreamer(context.Background(), "stream", "chat1")
+	if !ok {
+		t.Fatal("expected streamer to be returned")
+	}
+	if got != streamer {
+		t.Fatalf("got %T, want %T", got, streamer)
 	}
 }
 

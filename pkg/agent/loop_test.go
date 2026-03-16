@@ -342,6 +342,112 @@ func (m *countingMockProvider) GetDefaultModel() string {
 	return "counting-mock-model"
 }
 
+type streamingStep struct {
+	chunks   []string
+	response *providers.LLMResponse
+	err      error
+}
+
+type streamingMockProvider struct {
+	steps []streamingStep
+	calls int
+}
+
+func (m *streamingMockProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	if m.calls >= len(m.steps) {
+		return &providers.LLMResponse{Content: "fallback"}, nil
+	}
+	step := m.steps[m.calls]
+	m.calls++
+	return step.response, step.err
+}
+
+func (m *streamingMockProvider) ChatStream(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+	onChunk func(accumulated string),
+) (*providers.LLMResponse, error) {
+	if m.calls >= len(m.steps) {
+		return &providers.LLMResponse{Content: "fallback"}, nil
+	}
+	step := m.steps[m.calls]
+	m.calls++
+	for _, chunk := range step.chunks {
+		if onChunk != nil {
+			onChunk(chunk)
+		}
+	}
+	return step.response, step.err
+}
+
+func (m *streamingMockProvider) GetDefaultModel() string {
+	return "streaming-mock-model"
+}
+
+type recordingStreamer struct {
+	updates     []string
+	finalized   []string
+	events      []channels.StreamEvent
+	cancelCount int
+	delivered   bool
+	finalizeErr error
+	cancelErr   error
+}
+
+func (s *recordingStreamer) Update(ctx context.Context, accumulated string) error {
+	s.updates = append(s.updates, accumulated)
+	return nil
+}
+
+func (s *recordingStreamer) Finalize(ctx context.Context, finalContent string) (bool, error) {
+	s.finalized = append(s.finalized, finalContent)
+	return s.delivered, s.finalizeErr
+}
+
+func (s *recordingStreamer) Cancel(ctx context.Context) error {
+	s.cancelCount++
+	return s.cancelErr
+}
+
+func (s *recordingStreamer) AppendEvent(ctx context.Context, evt channels.StreamEvent) error {
+	s.events = append(s.events, evt)
+	return nil
+}
+
+type streamingChannel struct {
+	id       string
+	streamer channels.Streamer
+}
+
+func (c *streamingChannel) Name() string                                            { return c.id }
+func (c *streamingChannel) Start(ctx context.Context) error                         { return nil }
+func (c *streamingChannel) Stop(ctx context.Context) error                          { return nil }
+func (c *streamingChannel) Send(ctx context.Context, msg bus.OutboundMessage) error { return nil }
+func (c *streamingChannel) IsRunning() bool                                         { return true }
+func (c *streamingChannel) IsAllowed(string) bool                                   { return true }
+func (c *streamingChannel) IsAllowedSender(sender bus.SenderInfo) bool              { return true }
+func (c *streamingChannel) ReasoningChannelID() string                              { return "" }
+func (c *streamingChannel) BeginStream(ctx context.Context, chatID string) (channels.Streamer, error) {
+	return c.streamer, nil
+}
+
+type fakeMirrorManager struct {
+	streamers []channels.Streamer
+}
+
+func (m *fakeMirrorManager) BeginStream(ctx context.Context, channel, chatID string) []channels.Streamer {
+	return m.streamers
+}
+
 // mockCustomTool is a simple mock tool for registration testing
 type mockCustomTool struct{}
 
@@ -362,6 +468,27 @@ func (m *mockCustomTool) Parameters() map[string]any {
 
 func (m *mockCustomTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
 	return tools.SilentResult("Custom tool executed")
+}
+
+type mockUserTool struct{}
+
+func (m *mockUserTool) Name() string {
+	return "mock_user"
+}
+
+func (m *mockUserTool) Description() string {
+	return "Mock user-facing tool for streaming tests"
+}
+
+func (m *mockUserTool) Parameters() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+func (m *mockUserTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	return tools.UserResult("Tool says hello")
 }
 
 // testHelper executes a message and returns the response
@@ -572,6 +699,294 @@ func TestProcessMessage_SwitchModelShowModelConsistency(t *testing.T) {
 
 	if provider.calls != 0 {
 		t.Fatalf("LLM should not be called for /switch and /show, calls=%d", provider.calls)
+	}
+}
+
+func TestProcessMessage_StreamingSkipsFinalOutboundSend(t *testing.T) {
+	_, cfg, msgBus, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	streamProvider := &streamingMockProvider{
+		steps: []streamingStep{{
+			chunks: []string{"Hel", "Hello"},
+			response: &providers.LLMResponse{
+				Content:   "Hello",
+				ToolCalls: []providers.ToolCall{},
+			},
+		}},
+	}
+	al := NewAgentLoop(cfg, msgBus, streamProvider)
+
+	manager, err := channels.NewManager(cfg, msgBus, nil)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	streamer := &recordingStreamer{delivered: true}
+	manager.RegisterChannel("stream", &streamingChannel{id: "stream", streamer: streamer})
+	al.SetChannelManager(manager)
+
+	msg := bus.InboundMessage{
+		Channel:  "stream",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Content:  "hello",
+		Peer:     bus.Peer{Kind: "direct", ID: "user1"},
+	}
+
+	helper := testHelper{al: al}
+	response := helper.executeAndGetResponse(t, context.Background(), msg)
+	if response != "Hello" {
+		t.Fatalf("response = %q, want %q", response, "Hello")
+	}
+	if !slices.Equal(streamer.updates, []string{"Hel", "Hello"}) {
+		t.Fatalf("updates = %v, want %v", streamer.updates, []string{"Hel", "Hello"})
+	}
+	if !slices.Equal(streamer.finalized, []string{"Hello"}) {
+		t.Fatalf("finalized = %v, want %v", streamer.finalized, []string{"Hello"})
+	}
+
+	checkCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := msgBus.SubscribeOutbound(checkCtx); ok {
+		t.Fatal("expected no outbound message when streamer finalized delivery")
+	}
+}
+
+func TestProcessMessage_StreamingPersistsAcrossToolIterations(t *testing.T) {
+	_, cfg, msgBus, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	streamProvider := &streamingMockProvider{
+		steps: []streamingStep{
+			{
+				chunks: []string{"part", "partial"},
+				response: &providers.LLMResponse{
+					Content: "partial",
+					ToolCalls: []providers.ToolCall{
+						{ID: "call_1", Name: "mock_custom", Arguments: map[string]any{}},
+					},
+				},
+			},
+			{
+				chunks: []string{"new", "new final"},
+				response: &providers.LLMResponse{
+					Content:   "new final",
+					ToolCalls: []providers.ToolCall{},
+				},
+			},
+		},
+	}
+	al := NewAgentLoop(cfg, msgBus, streamProvider)
+	al.RegisterTool(&mockCustomTool{})
+
+	manager, err := channels.NewManager(cfg, msgBus, nil)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	streamer := &recordingStreamer{delivered: true}
+	manager.RegisterChannel("stream", &streamingChannel{id: "stream", streamer: streamer})
+	al.SetChannelManager(manager)
+
+	msg := bus.InboundMessage{
+		Channel:  "stream",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Content:  "do work",
+		Peer:     bus.Peer{Kind: "direct", ID: "user1"},
+	}
+
+	helper := testHelper{al: al}
+	response := helper.executeAndGetResponse(t, context.Background(), msg)
+	if response != "new final" {
+		t.Fatalf("response = %q, want %q", response, "new final")
+	}
+	if !slices.Equal(streamer.updates, []string{"part", "partial", "new", "new final"}) {
+		t.Fatalf("updates = %v", streamer.updates)
+	}
+	if !slices.Equal(streamer.finalized, []string{"new final"}) {
+		t.Fatalf("finalized = %v, want [new final]", streamer.finalized)
+	}
+	if len(streamer.events) != 3 {
+		t.Fatalf("events len = %d, want 3", len(streamer.events))
+	}
+	if streamer.events[0].Kind != channels.StreamEventToolPlan {
+		t.Fatalf("event[0].Kind = %q, want %q", streamer.events[0].Kind, channels.StreamEventToolPlan)
+	}
+	if streamer.events[1].Kind != channels.StreamEventToolStart {
+		t.Fatalf("event[1].Kind = %q, want %q", streamer.events[1].Kind, channels.StreamEventToolStart)
+	}
+	if streamer.events[2].Kind != channels.StreamEventToolResult {
+		t.Fatalf("event[2].Kind = %q, want %q", streamer.events[2].Kind, channels.StreamEventToolResult)
+	}
+	if got := streamer.events[0].Tools; len(got) != 1 || got[0].ToolName != "mock_custom" || got[0].ToolIndex != 0 {
+		t.Fatalf("tool plan = %+v, want mock_custom@0", got)
+	}
+	if streamer.cancelCount != 0 {
+		t.Fatalf("cancelCount = %d, want 0", streamer.cancelCount)
+	}
+}
+
+func TestProcessMessage_StreamingCancelOnProviderError(t *testing.T) {
+	_, cfg, msgBus, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	streamProvider := &streamingMockProvider{
+		steps: []streamingStep{{
+			chunks: []string{"Hel"},
+			err:    fmt.Errorf("boom"),
+		}},
+	}
+	al := NewAgentLoop(cfg, msgBus, streamProvider)
+
+	manager, err := channels.NewManager(cfg, msgBus, nil)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	streamer := &recordingStreamer{delivered: true}
+	manager.RegisterChannel("stream", &streamingChannel{id: "stream", streamer: streamer})
+	al.SetChannelManager(manager)
+
+	msg := bus.InboundMessage{
+		Channel:  "stream",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Content:  "hello",
+		Peer:     bus.Peer{Kind: "direct", ID: "user1"},
+	}
+
+	_, err = al.processMessage(context.Background(), msg)
+	if err == nil {
+		t.Fatal("expected provider error")
+	}
+	if streamer.cancelCount != 1 {
+		t.Fatalf("cancelCount = %d, want 1", streamer.cancelCount)
+	}
+}
+
+func TestProcessMessage_MirrorOnlyStillPublishesFinalOutbound(t *testing.T) {
+	_, cfg, msgBus, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	streamProvider := &streamingMockProvider{
+		steps: []streamingStep{{
+			chunks: []string{"Hel", "Hello"},
+			response: &providers.LLMResponse{
+				Content:   "Hello",
+				ToolCalls: []providers.ToolCall{},
+			},
+		}},
+	}
+	al := NewAgentLoop(cfg, msgBus, streamProvider)
+	mirror := &recordingStreamer{}
+	al.mirrorManager = &fakeMirrorManager{streamers: []channels.Streamer{mirror}}
+	agent := al.GetRegistry().GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	response, err := al.runAgentLoop(context.Background(), agent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "stream",
+		ChatID:          "chat1",
+		UserMessage:     "hello",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    true,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop() error = %v", err)
+	}
+	if response != "Hello" {
+		t.Fatalf("response = %q, want Hello", response)
+	}
+	if !slices.Equal(mirror.updates, []string{"Hel", "Hello"}) {
+		t.Fatalf("mirror updates = %v", mirror.updates)
+	}
+	if !slices.Equal(mirror.finalized, []string{"Hello"}) {
+		t.Fatalf("mirror finalized = %v, want [Hello]", mirror.finalized)
+	}
+
+	checkCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	outbound, ok := msgBus.SubscribeOutbound(checkCtx)
+	if !ok {
+		t.Fatal("expected final outbound publish when only mirror streaming is active")
+	}
+	if outbound.Content != "Hello" {
+		t.Fatalf("outbound content = %q, want Hello", outbound.Content)
+	}
+}
+
+func TestProcessMessage_StreamingFoldsToolForUserIntoCard(t *testing.T) {
+	_, cfg, msgBus, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	streamProvider := &streamingMockProvider{
+		steps: []streamingStep{
+			{
+				chunks: []string{"prep", "preparing"},
+				response: &providers.LLMResponse{
+					Content: "preparing",
+					ToolCalls: []providers.ToolCall{
+						{ID: "call_1", Name: "mock_user", Arguments: map[string]any{}},
+					},
+				},
+			},
+			{
+				chunks: []string{"done"},
+				response: &providers.LLMResponse{
+					Content:   "done",
+					ToolCalls: []providers.ToolCall{},
+				},
+			},
+		},
+	}
+	al := NewAgentLoop(cfg, msgBus, streamProvider)
+	al.RegisterTool(&mockUserTool{})
+
+	manager, err := channels.NewManager(cfg, msgBus, nil)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	streamer := &recordingStreamer{delivered: true}
+	manager.RegisterChannel("stream", &streamingChannel{id: "stream", streamer: streamer})
+	al.SetChannelManager(manager)
+
+	msg := bus.InboundMessage{
+		Channel:  "stream",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Content:  "do work",
+		Peer:     bus.Peer{Kind: "direct", ID: "user1"},
+	}
+
+	helper := testHelper{al: al}
+	response := helper.executeAndGetResponse(t, context.Background(), msg)
+	if response != "done" {
+		t.Fatalf("response = %q, want done", response)
+	}
+
+	var textEvent *channels.StreamEvent
+	for i := range streamer.events {
+		if streamer.events[i].Text != "" {
+			textEvent = &streamer.events[i]
+			break
+		}
+	}
+	if textEvent == nil {
+		t.Fatal("expected a folded ForUser progress event")
+	}
+	if textEvent.Text != "Tool says hello" {
+		t.Fatalf("folded text = %q, want %q", textEvent.Text, "Tool says hello")
+	}
+	if textEvent.Kind != channels.StreamEventToolResult {
+		t.Fatalf("text event kind = %q, want %q", textEvent.Kind, channels.StreamEventToolResult)
+	}
+
+	checkCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := msgBus.SubscribeOutbound(checkCtx); ok {
+		t.Fatal("expected no extra outbound user message when ForUser is folded into stream")
 	}
 }
 

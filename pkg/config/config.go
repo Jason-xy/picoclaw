@@ -77,17 +77,18 @@ func (f *FlexibleStringSlice) UnmarshalText(text []byte) error {
 }
 
 type Config struct {
-	Agents    AgentsConfig    `json:"agents"`
-	Bindings  []AgentBinding  `json:"bindings,omitempty"`
-	Session   SessionConfig   `json:"session,omitempty"`
-	Channels  ChannelsConfig  `json:"channels"`
-	Providers ProvidersConfig `json:"providers,omitempty"`
-	ModelList []ModelConfig   `json:"model_list"` // New model-centric provider configuration
-	Gateway   GatewayConfig   `json:"gateway"`
-	Tools     ToolsConfig     `json:"tools"`
-	Heartbeat HeartbeatConfig `json:"heartbeat"`
-	Devices   DevicesConfig   `json:"devices"`
-	Voice     VoiceConfig     `json:"voice"`
+	Agents        AgentsConfig        `json:"agents"`
+	Bindings      []AgentBinding      `json:"bindings,omitempty"`
+	Session       SessionConfig       `json:"session,omitempty"`
+	Channels      ChannelsConfig      `json:"channels"`
+	StreamMirrors StreamMirrorsConfig `json:"stream_mirrors,omitempty"`
+	Providers     ProvidersConfig     `json:"providers,omitempty"`
+	ModelList     []ModelConfig       `json:"model_list"` // New model-centric provider configuration
+	Gateway       GatewayConfig       `json:"gateway"`
+	Tools         ToolsConfig         `json:"tools"`
+	Heartbeat     HeartbeatConfig     `json:"heartbeat"`
+	Devices       DevicesConfig       `json:"devices"`
+	Voice         VoiceConfig         `json:"voice"`
 	// BuildInfo contains build-time version information
 	BuildInfo BuildInfo `json:"build_info,omitempty"`
 }
@@ -292,6 +293,25 @@ type PlaceholderConfig struct {
 	Text    string `json:"text,omitempty"`
 }
 
+type StreamingConfig struct {
+	Enabled bool   `json:"enabled,omitempty" env:"PICOCLAW_CHANNELS_FEISHU_STREAMING_ENABLED"`
+	Mode    string `json:"mode,omitempty" env:"PICOCLAW_CHANNELS_FEISHU_STREAMING_MODE"`
+}
+
+type StreamMirrorsConfig struct {
+	EPD EPDStreamMirrorConfig `json:"epd,omitempty"`
+}
+
+type EPDStreamMirrorConfig struct {
+	Enabled              bool   `json:"enabled,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_ENABLED"`
+	Python               string `json:"python,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_PYTHON"`
+	Module               string `json:"module,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_MODULE"`
+	ProjectRoot          string `json:"project_root,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_PROJECT_ROOT"`
+	TitleTemplate        string `json:"title_template,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_TITLE_TEMPLATE"`
+	RenderEveryTokens    int    `json:"render_every_tokens,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_RENDER_EVERY_TOKENS"`
+	MinPartialIntervalMS int    `json:"min_partial_interval_ms,omitempty" env:"PICOCLAW_STREAM_MIRRORS_EPD_MIN_PARTIAL_INTERVAL_MS"`
+}
+
 type WhatsAppConfig struct {
 	Enabled            bool                `json:"enabled"              env:"PICOCLAW_CHANNELS_WHATSAPP_ENABLED"`
 	BridgeURL          string              `json:"bridge_url"           env:"PICOCLAW_CHANNELS_WHATSAPP_BRIDGE_URL"`
@@ -322,6 +342,7 @@ type FeishuConfig struct {
 	AllowFrom           FlexibleStringSlice `json:"allow_from"              env:"PICOCLAW_CHANNELS_FEISHU_ALLOW_FROM"`
 	GroupTrigger        GroupTriggerConfig  `json:"group_trigger,omitempty"`
 	Placeholder         PlaceholderConfig   `json:"placeholder,omitempty"`
+	Streaming           StreamingConfig     `json:"streaming,omitempty"`
 	ReasoningChannelID  string              `json:"reasoning_channel_id"    env:"PICOCLAW_CHANNELS_FEISHU_REASONING_CHANNEL_ID"`
 	RandomReactionEmoji FlexibleStringSlice `json:"random_reaction_emoji"   env:"PICOCLAW_CHANNELS_FEISHU_RANDOM_REACTION_EMOJI"`
 }

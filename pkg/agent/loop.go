@@ -30,6 +30,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/routing"
 	"github.com/sipeed/picoclaw/pkg/skills"
 	"github.com/sipeed/picoclaw/pkg/state"
+	streamingmirror "github.com/sipeed/picoclaw/pkg/streaming"
 	"github.com/sipeed/picoclaw/pkg/tools"
 	"github.com/sipeed/picoclaw/pkg/utils"
 	"github.com/sipeed/picoclaw/pkg/voice"
@@ -44,6 +45,7 @@ type AgentLoop struct {
 	summarizing    sync.Map
 	fallback       *providers.FallbackChain
 	channelManager *channels.Manager
+	mirrorManager  streamMirrorStarter
 	mediaStore     media.MediaStore
 	transcriber    voice.Transcriber
 	cmdRegistry    *commands.Registry
@@ -51,6 +53,10 @@ type AgentLoop struct {
 	mu             sync.RWMutex
 	// Track active requests for safe provider cleanup
 	activeRequests sync.WaitGroup
+}
+
+type streamMirrorStarter interface {
+	BeginStream(ctx context.Context, channel, chatID string) []channels.Streamer
 }
 
 // processOptions configures how a message is processed
@@ -98,13 +104,14 @@ func NewAgentLoop(
 	}
 
 	al := &AgentLoop{
-		bus:         msgBus,
-		cfg:         cfg,
-		registry:    registry,
-		state:       stateManager,
-		summarizing: sync.Map{},
-		fallback:    fallbackChain,
-		cmdRegistry: commands.NewRegistry(commands.BuiltinDefinitions()),
+		bus:           msgBus,
+		cfg:           cfg,
+		registry:      registry,
+		state:         stateManager,
+		summarizing:   sync.Map{},
+		fallback:      fallbackChain,
+		mirrorManager: streamingmirror.NewMirrorManager(cfg),
+		cmdRegistry:   commands.NewRegistry(commands.BuiltinDefinitions()),
 	}
 
 	return al
@@ -890,7 +897,7 @@ func (al *AgentLoop) runAgentLoop(
 	agent.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
 	// 3. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
+	finalContent, iteration, streamedFinal, err := al.runLLMIteration(ctx, agent, messages, opts)
 	if err != nil {
 		return "", err
 	}
@@ -913,7 +920,7 @@ func (al *AgentLoop) runAgentLoop(
 	}
 
 	// 7. Optional: send response via bus
-	if opts.SendResponse {
+	if opts.SendResponse && !streamedFinal {
 		al.bus.PublishOutbound(ctx, bus.OutboundMessage{
 			Channel: opts.Channel,
 			ChatID:  opts.ChatID,
@@ -996,15 +1003,35 @@ func (al *AgentLoop) runLLMIteration(
 	agent *AgentInstance,
 	messages []providers.Message,
 	opts processOptions,
-) (string, int, error) {
+) (string, int, bool, error) {
 	iteration := 0
 	var finalContent string
+	streamedFinal := false
 
 	// Determine effective model tier for this conversation turn.
 	// selectCandidates evaluates routing once and the decision is sticky for
 	// all tool-follow-up iterations within the same turn so that a multi-step
 	// tool chain doesn't switch models mid-way through.
 	activeCandidates, activeModel := al.selectCandidates(agent, opts.UserMessage, messages)
+	var streamer channels.Streamer
+	var progressStreamer channels.ProgressStreamer
+	if len(activeCandidates) == 1 && !constants.IsInternalChannel(opts.Channel) && !opts.NoHistory {
+		var primaryStreamer channels.Streamer
+		if al.channelManager != nil {
+			if chStreamer, ok := al.channelManager.GetStreamer(ctx, opts.Channel, opts.ChatID); ok {
+				primaryStreamer = chStreamer
+			}
+		}
+		var mirrorStreamers []channels.Streamer
+		if al.mirrorManager != nil {
+			mirrorStreamers = al.mirrorManager.BeginStream(ctx, opts.Channel, opts.ChatID)
+		}
+		if composite := streamingmirror.NewFanoutStreamer(primaryStreamer, mirrorStreamers...); composite != nil {
+			streamer = composite
+			progressStreamer = composite
+		}
+	}
+	streamProvider, providerCanStream := agent.Provider.(providers.StreamingProvider)
 
 	for iteration < agent.MaxIterations {
 		iteration++
@@ -1063,6 +1090,26 @@ func (al *AgentLoop) runLLMIteration(
 		callLLM := func() (*providers.LLMResponse, error) {
 			al.activeRequests.Add(1)
 			defer al.activeRequests.Done()
+
+			if streamer != nil && providerCanStream && len(activeCandidates) == 1 {
+				return streamProvider.ChatStream(
+					ctx,
+					messages,
+					providerToolDefs,
+					activeModel,
+					llmOpts,
+					func(accumulated string) {
+						if err := streamer.Update(ctx, accumulated); err != nil {
+							logger.DebugCF("agent", "stream update failed, continuing without interrupting LLM call", map[string]any{
+								"agent_id": agent.ID,
+								"channel":  opts.Channel,
+								"chat_id":  opts.ChatID,
+								"error":    err.Error(),
+							})
+						}
+					},
+				)
+			}
 
 			if len(activeCandidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
@@ -1165,7 +1212,10 @@ func (al *AgentLoop) runLLMIteration(
 					"model":     activeModel,
 					"error":     err.Error(),
 				})
-			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
+			if streamer != nil {
+				_ = streamer.Cancel(ctx)
+			}
+			return "", iteration, false, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
 
 		go al.handleReasoning(
@@ -1191,11 +1241,26 @@ func (al *AgentLoop) runLLMIteration(
 			if finalContent == "" && response.ReasoningContent != "" {
 				finalContent = response.ReasoningContent
 			}
+			if streamer != nil {
+				delivered, err := streamer.Finalize(ctx, finalContent)
+				if err != nil {
+					logger.WarnCF("agent", "stream finalize failed; falling back to normal outbound send", map[string]any{
+						"agent_id":  agent.ID,
+						"channel":   opts.Channel,
+						"chat_id":   opts.ChatID,
+						"iteration": iteration,
+						"error":     err.Error(),
+					})
+				} else {
+					streamedFinal = delivered
+				}
+			}
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 				map[string]any{
 					"agent_id":      agent.ID,
 					"iteration":     iteration,
 					"content_chars": len(finalContent),
+					"streamed":      streamedFinal,
 				})
 			break
 		}
@@ -1217,6 +1282,30 @@ func (al *AgentLoop) runLLMIteration(
 				"count":     len(normalizedToolCalls),
 				"iteration": iteration,
 			})
+		if progressStreamer != nil {
+			toolRefs := make([]channels.StreamToolRef, 0, len(normalizedToolCalls))
+			for i, tc := range normalizedToolCalls {
+				toolRefs = append(toolRefs, channels.StreamToolRef{
+					ToolCallID: tc.ID,
+					ToolIndex:  i,
+					ToolName:   tc.Name,
+				})
+			}
+			if err := progressStreamer.AppendEvent(ctx, channels.StreamEvent{
+				Kind:      channels.StreamEventToolPlan,
+				Iteration: iteration,
+				Tools:     toolRefs,
+			}); err != nil {
+				logger.DebugCF("agent", "stream progress event failed", map[string]any{
+					"agent_id":  agent.ID,
+					"channel":   opts.Channel,
+					"chat_id":   opts.ChatID,
+					"iteration": iteration,
+					"kind":      channels.StreamEventToolPlan,
+					"error":     err.Error(),
+				})
+			}
+		}
 
 		// Build assistant message with tool calls
 		assistantMsg := providers.Message{
@@ -1275,6 +1364,25 @@ func (al *AgentLoop) runLLMIteration(
 						"tool":      tc.Name,
 						"iteration": iteration,
 					})
+				if progressStreamer != nil {
+					if err := progressStreamer.AppendEvent(ctx, channels.StreamEvent{
+						Kind:       channels.StreamEventToolStart,
+						Iteration:  iteration,
+						ToolCallID: tc.ID,
+						ToolIndex:  idx,
+						ToolName:   tc.Name,
+					}); err != nil {
+						logger.DebugCF("agent", "stream progress event failed", map[string]any{
+							"agent_id":  agent.ID,
+							"channel":   opts.Channel,
+							"chat_id":   opts.ChatID,
+							"iteration": iteration,
+							"kind":      channels.StreamEventToolStart,
+							"tool":      tc.Name,
+							"error":     err.Error(),
+						})
+					}
+				}
 
 				// Create async callback for tools that implement AsyncExecutor.
 				// When the background work completes, this publishes the result
@@ -1328,24 +1436,85 @@ func (al *AgentLoop) runLLMIteration(
 					asyncCallback,
 				)
 				agentResults[idx].result = toolResult
+				if progressStreamer != nil && toolResult != nil {
+					kind := channels.StreamEventToolResult
+					if toolResult.IsError || toolResult.Err != nil {
+						kind = channels.StreamEventToolError
+					}
+					if err := progressStreamer.AppendEvent(ctx, channels.StreamEvent{
+						Kind:       kind,
+						Iteration:  iteration,
+						ToolCallID: tc.ID,
+						ToolIndex:  idx,
+						ToolName:   tc.Name,
+					}); err != nil {
+						logger.DebugCF("agent", "stream progress event failed", map[string]any{
+							"agent_id":  agent.ID,
+							"channel":   opts.Channel,
+							"chat_id":   opts.ChatID,
+							"iteration": iteration,
+							"kind":      kind,
+							"tool":      tc.Name,
+							"error":     err.Error(),
+						})
+					}
+				}
 			}(i, tc)
 		}
 		wg.Wait()
 
 		// Process results in original order (send to user, save to session)
-		for _, r := range agentResults {
-			// Send ForUser content to user immediately if not Silent
-			if !r.result.Silent && r.result.ForUser != "" && opts.SendResponse {
-				al.bus.PublishOutbound(ctx, bus.OutboundMessage{
-					Channel: opts.Channel,
-					ChatID:  opts.ChatID,
-					Content: r.result.ForUser,
-				})
-				logger.DebugCF("agent", "Sent tool result to user",
-					map[string]any{
-						"tool":        r.tc.Name,
-						"content_len": len(r.result.ForUser),
+		for idx, r := range agentResults {
+			if r.result == nil {
+				r.result = tools.ErrorResult(fmt.Sprintf("tool %q returned no result", r.tc.Name))
+				agentResults[idx].result = r.result
+			}
+
+			toolResultKind := channels.StreamEventToolResult
+			if r.result.IsError || r.result.Err != nil {
+				toolResultKind = channels.StreamEventToolError
+			}
+
+			// Fold ForUser content into the active progress card when available.
+			// This is independent from opts.SendResponse because regular channel
+			// turns still run with SendResponse=false but should keep showing
+			// progress inside the same Feishu card.
+			if !r.result.Silent && r.result.ForUser != "" {
+				foldedIntoStream := false
+				if progressStreamer != nil {
+					if err := progressStreamer.AppendEvent(ctx, channels.StreamEvent{
+						Kind:       toolResultKind,
+						Iteration:  iteration,
+						ToolCallID: r.tc.ID,
+						ToolIndex:  idx,
+						ToolName:   r.tc.Name,
+						Text:       r.result.ForUser,
+					}); err != nil {
+						logger.DebugCF("agent", "stream progress event failed", map[string]any{
+							"agent_id":  agent.ID,
+							"channel":   opts.Channel,
+							"chat_id":   opts.ChatID,
+							"iteration": iteration,
+							"kind":      toolResultKind,
+							"tool":      r.tc.Name,
+							"error":     err.Error(),
+						})
+					} else {
+						foldedIntoStream = true
+					}
+				}
+				if !foldedIntoStream && opts.SendResponse {
+					al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+						Channel: opts.Channel,
+						ChatID:  opts.ChatID,
+						Content: r.result.ForUser,
 					})
+					logger.DebugCF("agent", "Sent tool result to user",
+						map[string]any{
+							"tool":        r.tc.Name,
+							"content_len": len(r.result.ForUser),
+						})
+				}
 			}
 
 			// If tool returned media refs, publish them as outbound media
@@ -1398,7 +1567,7 @@ func (al *AgentLoop) runLLMIteration(
 		})
 	}
 
-	return finalContent, iteration, nil
+	return finalContent, iteration, streamedFinal, nil
 }
 
 // selectCandidates returns the model candidates and resolved model name to use

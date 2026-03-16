@@ -37,6 +37,20 @@ type StatefulProvider interface {
 	Close()
 }
 
+// StreamingProvider is an optional interface for providers that can emit
+// progressively accumulated assistant text while still returning a complete
+// LLMResponse for tool-call handling compatibility.
+type StreamingProvider interface {
+	ChatStream(
+		ctx context.Context,
+		messages []Message,
+		tools []ToolDefinition,
+		model string,
+		options map[string]any,
+		onChunk func(accumulated string),
+	) (*LLMResponse, error)
+}
+
 // ThinkingCapable is an optional interface for providers that support
 // extended thinking (e.g. Anthropic). Used by the agent loop to warn
 // when thinking_level is configured but the active provider cannot use it.

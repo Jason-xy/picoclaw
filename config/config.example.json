@@ -235,6 +235,17 @@
       "reasoning_channel_id": ""
     }
   },
+  "stream_mirrors": {
+    "epd": {
+      "enabled": false,
+      "python": "python3",
+      "module": "epd.picoclaw_worker",
+      "project_root": "/home/dji/ws/E-Paper/epd",
+      "title_template": "PicoClaw {channel}",
+      "render_every_tokens": 1,
+      "min_partial_interval_ms": 80
+    }
+  },
   "providers": {
     "_comment": "DEPRECATED: Use model_list instead. This will be removed in a future version",
     "anthropic": {

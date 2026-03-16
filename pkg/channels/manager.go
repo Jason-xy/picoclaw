@@ -795,6 +795,32 @@ func (m *Manager) GetChannel(name string) (Channel, bool) {
 	return channel, ok
 }
 
+// GetStreamer returns a chat-scoped streaming surface when the channel
+// implements StreamingCapable. Channels that do not support streaming simply
+// return (nil, false).
+func (m *Manager) GetStreamer(ctx context.Context, channelName, chatID string) (Streamer, bool) {
+	m.mu.RLock()
+	channel, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	sc, ok := channel.(StreamingCapable)
+	if !ok {
+		return nil, false
+	}
+	streamer, err := sc.BeginStream(ctx, chatID)
+	if err != nil {
+		logger.DebugCF("channels", "Streaming unavailable, falling back to normal delivery", map[string]any{
+			"channel": channelName,
+			"chat_id": chatID,
+			"error":   err.Error(),
+		})
+		return nil, false
+	}
+	return streamer, true
+}
+
 func (m *Manager) GetStatus() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

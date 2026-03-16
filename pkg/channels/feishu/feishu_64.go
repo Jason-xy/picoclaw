@@ -155,6 +155,9 @@ func (c *FeishuChannel) EditMessage(ctx context.Context, chatID, messageID, cont
 // SendPlaceholder implements channels.PlaceholderCapable.
 // Sends an interactive card with placeholder text and returns its message ID.
 func (c *FeishuChannel) SendPlaceholder(ctx context.Context, chatID string) (string, error) {
+	if c.config.Streaming.Enabled {
+		return "", nil
+	}
 	if !c.config.Placeholder.Enabled {
 		logger.DebugCF("feishu", "Placeholder disabled, skipping", map[string]any{
 			"chat_id": chatID,

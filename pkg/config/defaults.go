@@ -66,6 +66,10 @@ func DefaultConfig() *Config {
 				EncryptKey:        "",
 				VerificationToken: "",
 				AllowFrom:         FlexibleStringSlice{},
+				Streaming: StreamingConfig{
+					Enabled: false,
+					Mode:    "auto",
+				},
 			},
 			Discord: DiscordConfig{
 				Enabled:     false,
@@ -174,6 +178,17 @@ func DefaultConfig() *Config {
 				WriteTimeout:   10,
 				MaxConnections: 100,
 				AllowFrom:      FlexibleStringSlice{},
+			},
+		},
+		StreamMirrors: StreamMirrorsConfig{
+			EPD: EPDStreamMirrorConfig{
+				Enabled:              false,
+				Python:               "python3",
+				Module:               "epd.picoclaw_worker",
+				ProjectRoot:          "",
+				TitleTemplate:        "PicoClaw",
+				RenderEveryTokens:    1,
+				MinPartialIntervalMS: 80,
 			},
 		},
 		Providers: ProvidersConfig{

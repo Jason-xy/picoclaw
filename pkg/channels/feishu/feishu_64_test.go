@@ -3,9 +3,16 @@
 package feishu
 
 import (
+	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+
+	"github.com/sipeed/picoclaw/pkg/channels"
+	"github.com/sipeed/picoclaw/pkg/config"
 )
 
 func TestExtractContent(t *testing.T) {
@@ -252,5 +259,203 @@ func TestExtractFeishuSenderID(t *testing.T) {
 				t.Errorf("extractFeishuSenderID() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeFeishuStreamMode(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want feishuStreamMode
+	}{
+		{name: "default auto", in: "", want: feishuStreamAuto},
+		{name: "cardkit", in: "cardkit", want: feishuStreamCardKit},
+		{name: "patch", in: "patch", want: feishuStreamPatch},
+		{name: "unknown", in: "weird", want: feishuStreamAuto},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeFeishuStreamMode(tt.in); got != tt.want {
+				t.Fatalf("normalizeFeishuStreamMode(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildStreamingThinkingCardJSON(t *testing.T) {
+	raw, err := buildStreamingThinkingCardJSON("Thinking...")
+	if err != nil {
+		t.Fatalf("buildStreamingThinkingCardJSON() error = %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("unmarshal = %v", err)
+	}
+	configMap, ok := payload["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("config missing or wrong type: %T", payload["config"])
+	}
+	if got, ok := configMap["streaming_mode"].(bool); !ok || !got {
+		t.Fatalf("streaming_mode = %v, want true", configMap["streaming_mode"])
+	}
+	body, ok := payload["body"].(map[string]any)
+	if !ok {
+		t.Fatalf("body missing or wrong type: %T", payload["body"])
+	}
+	elements, ok := body["elements"].([]any)
+	if !ok || len(elements) != 2 {
+		t.Fatalf("elements = %v, want 2 elements", body["elements"])
+	}
+}
+
+func TestBuildStructuredCardJSON_ContainsToolStatusLane(t *testing.T) {
+	raw, err := buildStructuredCardJSON("hello", "✅ read_file - complete", false, "hello")
+	if err != nil {
+		t.Fatalf("buildStructuredCardJSON() error = %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("unmarshal = %v", err)
+	}
+	body, ok := payload["body"].(map[string]any)
+	if !ok {
+		t.Fatalf("body missing or wrong type: %T", payload["body"])
+	}
+	elements, ok := body["elements"].([]any)
+	if !ok || len(elements) != 2 {
+		t.Fatalf("elements = %v, want 2 elements", body["elements"])
+	}
+	second, ok := elements[1].(map[string]any)
+	if !ok {
+		t.Fatalf("second element wrong type: %T", elements[1])
+	}
+	if got := second["element_id"]; got != feishuToolStatusElement {
+		t.Fatalf("tool status element_id = %v, want %q", got, feishuToolStatusElement)
+	}
+}
+
+func TestFeishuStreamer_AccumulatesAcrossIterations(t *testing.T) {
+	s := &feishuStreamer{initial: "Thinking..."}
+	s.cond = sync.NewCond(&s.mu)
+
+	s.mu.Lock()
+	if !s.applyAccumulatedLocked("part") {
+		t.Fatal("expected first partial to change state")
+	}
+	if !s.applyAccumulatedLocked("partial") {
+		t.Fatal("expected expanded partial to change state")
+	}
+	if !s.applyAccumulatedLocked("new") {
+		t.Fatal("expected shorter next-iteration partial to change state")
+	}
+	got := s.renderMainLocked()
+	s.mu.Unlock()
+
+	want := "partial\n\nnew"
+	if got != want {
+		t.Fatalf("renderMainLocked() = %q, want %q", got, want)
+	}
+}
+
+func TestFeishuStreamer_ProgressEventsStayOrderedAndFoldText(t *testing.T) {
+	s := &feishuStreamer{initial: "Thinking..."}
+	s.cond = sync.NewCond(&s.mu)
+
+	s.mu.Lock()
+	s.applyAccumulatedLocked("Planning migration")
+	s.applyEventLocked(channels.StreamEvent{
+		Kind: channels.StreamEventToolPlan,
+		Tools: []channels.StreamToolRef{
+			{ToolCallID: "call_b", ToolIndex: 1, ToolName: "copy_auth"},
+			{ToolCallID: "call_a", ToolIndex: 0, ToolName: "read_config"},
+		},
+	})
+	s.applyEventLocked(channels.StreamEvent{
+		Kind:       channels.StreamEventToolStart,
+		ToolCallID: "call_b",
+		ToolIndex:  1,
+		ToolName:   "copy_auth",
+	})
+	s.applyEventLocked(channels.StreamEvent{
+		Kind:       channels.StreamEventToolResult,
+		ToolCallID: "call_a",
+		ToolIndex:  0,
+		ToolName:   "read_config",
+		Text:       "Read picoclaw config",
+	})
+	mainContent := s.renderMainLocked()
+	toolStatus := s.renderToolStatusLocked()
+	s.mu.Unlock()
+
+	if mainContent != "Planning migration\n\n```text\nRead picoclaw config\n```" {
+		t.Fatalf("mainContent = %q", mainContent)
+	}
+	wantStatus := "✅ read_config - complete\n🔄 copy_auth - running"
+	if toolStatus != wantStatus {
+		t.Fatalf("toolStatus = %q, want %q", toolStatus, wantStatus)
+	}
+}
+
+func TestFormatFeishuToolOutputBlock_EscapesEmbeddedBackticks(t *testing.T) {
+	got := formatFeishuToolOutputBlock("line1\n```warn```\nline2")
+	want := "````text\nline1\n```warn```\nline2\n````"
+	if got != want {
+		t.Fatalf("formatFeishuToolOutputBlock() = %q, want %q", got, want)
+	}
+}
+
+func TestSendPlaceholderSuppressedWhenStreamingEnabled(t *testing.T) {
+	ch := &FeishuChannel{
+		config: config.FeishuConfig{
+			Streaming: config.StreamingConfig{Enabled: true},
+			Placeholder: config.PlaceholderConfig{
+				Enabled: true,
+				Text:    "Thinking...",
+			},
+		},
+	}
+
+	id, err := ch.SendPlaceholder(context.Background(), "oc_chat")
+	if err != nil {
+		t.Fatalf("SendPlaceholder() error = %v", err)
+	}
+	if id != "" {
+		t.Fatalf("placeholder id = %q, want empty", id)
+	}
+}
+
+func TestRetryFeishuCall_RebuildsClientOnAuthCode(t *testing.T) {
+	ch := &FeishuChannel{
+		config: config.FeishuConfig{
+			AppID:     "app",
+			AppSecret: "secret",
+		},
+		client: lark.NewClient("app", "secret"),
+	}
+
+	var attempts int
+	var clients []*lark.Client
+	value, err := retryFeishuCall(ch, func(client *lark.Client) (string, int, error) {
+		attempts++
+		clients = append(clients, client)
+		if attempts == 1 {
+			return "", feishuAuthErrorCode, nil
+		}
+		return "ok", 0, nil
+	})
+	if err != nil {
+		t.Fatalf("retryFeishuCall() error = %v", err)
+	}
+	if value != "ok" {
+		t.Fatalf("value = %q, want ok", value)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if len(clients) != 2 || clients[0] == clients[1] {
+		t.Fatal("expected client rebuild between attempts")
 	}
 }

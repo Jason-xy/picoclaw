@@ -19,6 +19,52 @@ type MessageEditor interface {
 	EditMessage(ctx context.Context, chatID string, messageID string, content string) error
 }
 
+// StreamingCapable — channels that can show progressively updated assistant output.
+// BeginStream creates a chat-scoped stream surface that stays alive for the
+// duration of one user turn.
+type StreamingCapable interface {
+	BeginStream(ctx context.Context, chatID string) (Streamer, error)
+}
+
+// Streamer receives progressively accumulated assistant text and finalizes the
+// delivery surface at the end of the turn.
+type Streamer interface {
+	Update(ctx context.Context, accumulated string) error
+	Finalize(ctx context.Context, finalContent string) (delivered bool, err error)
+	Cancel(ctx context.Context) error
+}
+
+type StreamEventKind string
+
+const (
+	StreamEventToolPlan   StreamEventKind = "tool_plan"
+	StreamEventToolStart  StreamEventKind = "tool_start"
+	StreamEventToolResult StreamEventKind = "tool_result"
+	StreamEventToolError  StreamEventKind = "tool_error"
+)
+
+type StreamToolRef struct {
+	ToolCallID string
+	ToolIndex  int
+	ToolName   string
+}
+
+type StreamEvent struct {
+	Kind       StreamEventKind
+	Iteration  int
+	ToolCallID string
+	ToolIndex  int
+	ToolName   string
+	Text       string
+	Tools      []StreamToolRef
+}
+
+// ProgressStreamer is an optional extension for channels that want to fold
+// execution progress into the same reply surface used for text streaming.
+type ProgressStreamer interface {
+	AppendEvent(ctx context.Context, evt StreamEvent) error
+}
+
 // ReactionCapable — channels that can add a reaction (e.g. 👀) to an inbound message.
 // ReactToMessage adds a reaction and returns an undo function to remove it.
 // The undo function MUST be idempotent and safe to call multiple times.
